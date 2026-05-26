@@ -1,17 +1,29 @@
 #include <stdio.h>
+
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/queue.h"
 
-// This struct holds one sensor reading
-// Later this will carry real BME280 data
+//--------------------------------------------------
+// Sensor data structure
+//--------------------------------------------------
+
 typedef struct {
     float temperature;
     float humidity;
     float pressure;
 } SensorData_t;
 
-// Your first FreeRTOS task
-// This is the heart of your environmental monitor
+//--------------------------------------------------
+// Global Queue Handle
+//--------------------------------------------------
+
+QueueHandle_t sensor_queue;
+
+//--------------------------------------------------
+// Sensor Task (Producer)
+//--------------------------------------------------
+
 void sensor_task(void *pvParameters)
 {
     SensorData_t data;
@@ -19,44 +31,112 @@ void sensor_task(void *pvParameters)
 
     printf("Sensor task started!\n");
 
-    while(1) {
-        // RIGHT NOW: fake values
-        // LATER: replace these 3 lines with real BME280 driver calls
+    while(1)
+    {
+        //--------------------------------------------------
+        // Simulate sensor readings
+        //--------------------------------------------------
+
         data.temperature = 25.0f + (reading_count % 10) * 0.1f;
         data.humidity    = 60.0f + (reading_count % 5)  * 0.2f;
         data.pressure    = 1013.0f;
 
         reading_count++;
 
-        // Print the reading
-        printf("[Sensor] Reading #%d -> Temp: %.1f C  Humidity: %.1f%%  Pressure: %.1f hPa\n",
-               reading_count,
-               data.temperature,
-               data.humidity,
-               data.pressure);
+        //--------------------------------------------------
+        // Send data to queue
+        //--------------------------------------------------
 
-        // Sleep for 500ms — releases CPU to other tasks
-        // pdMS_TO_TICKS converts milliseconds to FreeRTOS ticks
+        if(xQueueSend(sensor_queue, &data, portMAX_DELAY) == pdPASS)
+        {
+            printf("[Sensor] Sent Reading #%d to queue\n", reading_count);
+        }
+
+        //--------------------------------------------------
+        // Wait 500ms
+        //--------------------------------------------------
+
         vTaskDelay(pdMS_TO_TICKS(500));
     }
-    // We never reach here
-    // A FreeRTOS task never returns
 }
+
+//--------------------------------------------------
+// Display Task (Consumer)
+//--------------------------------------------------
+
+void display_task(void *pvParameters)
+{
+    SensorData_t received_data;
+
+    printf("Display task started!\n");
+
+    while(1)
+    {
+        //--------------------------------------------------
+        // Wait forever until data arrives
+        //--------------------------------------------------
+
+        if(xQueueReceive(sensor_queue,
+                         &received_data,
+                         portMAX_DELAY) == pdPASS)
+        {
+            printf("[Display] Temp: %.1f C | Humidity: %.1f%% | Pressure: %.1f hPa\n",
+                   received_data.temperature,
+                   received_data.humidity,
+                   received_data.pressure);
+        }
+    }
+}
+
+//--------------------------------------------------
+// Main Application
+//--------------------------------------------------
 
 void app_main(void)
 {
     printf("Environmental Monitor starting...\n");
 
-    // Create the sensor task
-    // This registers it with the FreeRTOS scheduler
+    //--------------------------------------------------
+    // Create Queue
+    //--------------------------------------------------
+
+    sensor_queue = xQueueCreate(
+                        5,                      // queue length
+                        sizeof(SensorData_t)); // item size
+
+    if(sensor_queue == NULL)
+    {
+        printf("Failed to create queue!\n");
+        return;
+    }
+
+    printf("Queue created successfully.\n");
+
+    //--------------------------------------------------
+    // Create Sensor Task
+    //--------------------------------------------------
+
     xTaskCreate(
-        sensor_task,        // function to run
-        "sensor_task",      // name (for debugging)
-        4096,               // stack size in bytes
-        NULL,               // parameters to pass (none yet)
-        5,                  // priority (higher = more important)
-        NULL                // task handle (we don't need it yet)
+        sensor_task,
+        "sensor_task",
+        4096,
+        NULL,
+        5,
+        NULL
     );
 
-    printf("Sensor task created. Scheduler is running.\n");
+    //--------------------------------------------------
+    // Create Display Task
+    //--------------------------------------------------
+
+    xTaskCreate(
+        display_task,
+        "display_task",
+        4096,
+        NULL,
+        4,
+        NULL
+    );
+
+    printf("Tasks created. Scheduler running.\n");
 }
