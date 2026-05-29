@@ -1,15 +1,24 @@
 #include <stdio.h>
+#include <stdbool.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
+#include "freertos/event_groups.h"
 
 //--------------------------------------------------
-// Sensor data structure
+// Event Group Bits
 //--------------------------------------------------
+#define WIFI_READY_BIT      BIT0
+#define SENSOR_READY_BIT    BIT1
+#define DISPLAY_READY_BIT   BIT2
 
-typedef struct {
+//--------------------------------------------------
+// Sensor Data Structure
+//--------------------------------------------------
+typedef struct
+{
     float temperature;
     float humidity;
     float pressure;
@@ -18,39 +27,52 @@ typedef struct {
 //--------------------------------------------------
 // Global Handles
 //--------------------------------------------------
-
-// Separate queues for each consumer
-QueueHandle_t display_queue;
-QueueHandle_t mqtt_queue;
-
-// Mutex for shared I2C bus
+QueueHandle_t sensor_queue;
 SemaphoreHandle_t i2c_mutex;
-
-// Binary semaphore for WiFi ready event
-SemaphoreHandle_t wifi_semaphore;
+EventGroupHandle_t system_event_group;
 
 //--------------------------------------------------
-// Sensor Task (Producer)
+// WiFi Task
 //--------------------------------------------------
+void wifi_task(void *pvParameters)
+{
+    printf("[WiFi] Connecting...\n");
 
+    // Simulate WiFi connection delay
+    vTaskDelay(pdMS_TO_TICKS(5000));
+
+    printf("[WiFi] Connected.\n");
+
+    xEventGroupSetBits(
+        system_event_group,
+        WIFI_READY_BIT
+    );
+
+    printf("[WiFi] WIFI_READY_BIT set.\n");
+
+    vTaskDelete(NULL);
+}
+
+//--------------------------------------------------
+// Sensor Task
+//--------------------------------------------------
 void sensor_task(void *pvParameters)
 {
     SensorData_t data;
     int reading_count = 0;
+    bool sensor_ready_signalled = false;
 
-    printf("[Sensor] Task started\n");
+    printf("[Sensor] Task started.\n");
 
     while(1)
     {
         //--------------------------------------------------
-        // Protect I2C access
+        // Take I2C mutex
         //--------------------------------------------------
-
         xSemaphoreTake(i2c_mutex, portMAX_DELAY);
 
-        // Fake sensor readings
         data.temperature = 25.0f + (reading_count % 10) * 0.1f;
-        data.humidity    = 60.0f + (reading_count % 5)  * 0.2f;
+        data.humidity    = 60.0f + (reading_count % 5) * 0.2f;
         data.pressure    = 1013.0f;
 
         xSemaphoreGive(i2c_mutex);
@@ -58,118 +80,71 @@ void sensor_task(void *pvParameters)
         reading_count++;
 
         //--------------------------------------------------
-        // Send data to BOTH queues
+        // Signal sensor ready only once
         //--------------------------------------------------
-
-        xQueueSend(display_queue, &data, portMAX_DELAY);
-        xQueueSend(mqtt_queue, &data, portMAX_DELAY);
-
-        printf("[Sensor] Reading #%d sent to queues\n",
-               reading_count);
-
-        vTaskDelay(pdMS_TO_TICKS(500));
-    }
-}
-
-//--------------------------------------------------
-// Display Task
-//--------------------------------------------------
-
-void display_task(void *pvParameters)
-{
-    SensorData_t received_data;
-
-    printf("[Display] Task started\n");
-
-    while(1)
-    {
-        if(xQueueReceive(display_queue,
-                         &received_data,
-                         portMAX_DELAY) == pdPASS)
+        if(!sensor_ready_signalled)
         {
-            //--------------------------------------------------
-            // Protect OLED I2C access
-            //--------------------------------------------------
+            xEventGroupSetBits(
+                system_event_group,
+                SENSOR_READY_BIT
+            );
 
-            xSemaphoreTake(i2c_mutex, portMAX_DELAY);
+            sensor_ready_signalled = true;
 
-            printf("[Display] Temp: %.1f C | "
-                   "Humidity: %.1f%% | "
-                   "Pressure: %.1f hPa\n",
-                   received_data.temperature,
-                   received_data.humidity,
-                   received_data.pressure);
-
-            xSemaphoreGive(i2c_mutex);
+            printf("[Sensor] SENSOR_READY_BIT set.\n");
         }
-    }
-}
 
-//--------------------------------------------------
-// WiFi Task
-//--------------------------------------------------
-
-void wifi_task(void *pvParameters)
-{
-    printf("[WiFi] Connecting to WiFi...\n");
-
-    //--------------------------------------------------
-    // Simulate WiFi connection delay
-    //--------------------------------------------------
-
-    vTaskDelay(pdMS_TO_TICKS(3000));
-
-    printf("[WiFi] Connected!\n");
-
-    //--------------------------------------------------
-    // Signal MQTT task
-    //--------------------------------------------------
-
-    xSemaphoreGive(wifi_semaphore);
-
-    while(1)
-    {
         //--------------------------------------------------
-        // Future:
-        // monitor WiFi health
-        // reconnect if disconnected
+        // Send data to queue
         //--------------------------------------------------
+        if(xQueueSend(sensor_queue,
+                      &data,
+                      portMAX_DELAY) == pdPASS)
+        {
+            printf("[Sensor] Reading #%d sent.\n",
+                   reading_count);
+        }
 
-        vTaskDelay(pdMS_TO_TICKS(5000));
+        vTaskDelay(pdMS_TO_TICKS(1000));
     }
 }
 
 //--------------------------------------------------
 // MQTT Task
 //--------------------------------------------------
-
 void mqtt_task(void *pvParameters)
 {
-    SensorData_t received_data;
+    SensorData_t data;
 
-    printf("[MQTT] Waiting for WiFi...\n");
+    printf("[MQTT] Waiting for WiFi AND Sensor...\n");
 
     //--------------------------------------------------
-    // Wait until WiFi task signals connection
+    // Wait for BOTH bits
     //--------------------------------------------------
+    xEventGroupWaitBits(
+        system_event_group,
+        WIFI_READY_BIT | SENSOR_READY_BIT,
+        pdFALSE,
+        pdTRUE,
+        portMAX_DELAY
+    );
 
-    xSemaphoreTake(wifi_semaphore, portMAX_DELAY);
-
-    printf("[MQTT] WiFi ready! Starting publishing...\n");
+    printf("[MQTT] System Ready.\n");
+    printf("[MQTT] Publishing started.\n");
 
     while(1)
     {
-        if(xQueueReceive(mqtt_queue,
-                         &received_data,
+        if(xQueueReceive(sensor_queue,
+                         &data,
                          portMAX_DELAY) == pdPASS)
         {
-            printf("[MQTT] Publishing -> "
+            printf("[MQTT] Publish => "
                    "Temp: %.1f C | "
                    "Humidity: %.1f%% | "
                    "Pressure: %.1f hPa\n",
-                   received_data.temperature,
-                   received_data.humidity,
-                   received_data.pressure);
+                   data.temperature,
+                   data.humidity,
+                   data.pressure);
         }
     }
 }
@@ -177,85 +152,79 @@ void mqtt_task(void *pvParameters)
 //--------------------------------------------------
 // Main Application
 //--------------------------------------------------
-
 void app_main(void)
 {
-    printf("Environmental Monitor Starting...\n");
+    printf("System Starting...\n");
 
     //--------------------------------------------------
-    // Create Queues
+    // Create Queue
     //--------------------------------------------------
+    sensor_queue = xQueueCreate(
+        5,
+        sizeof(SensorData_t)
+    );
 
-    display_queue = xQueueCreate(5, sizeof(SensorData_t));
-    mqtt_queue    = xQueueCreate(5, sizeof(SensorData_t));
-
-    if(display_queue == NULL || mqtt_queue == NULL)
+    if(sensor_queue == NULL)
     {
-        printf("Failed to create queues!\n");
+        printf("Queue creation failed!\n");
         return;
     }
-
-    printf("Queues created successfully\n");
 
     //--------------------------------------------------
     // Create Mutex
     //--------------------------------------------------
-
     i2c_mutex = xSemaphoreCreateMutex();
 
     if(i2c_mutex == NULL)
     {
-        printf("Failed to create mutex!\n");
+        printf("Mutex creation failed!\n");
         return;
     }
 
-    printf("Mutex created successfully\n");
-
     //--------------------------------------------------
-    // Create Binary Semaphore
+    // Create Event Group
     //--------------------------------------------------
+    system_event_group = xEventGroupCreate();
 
-    wifi_semaphore = xSemaphoreCreateBinary();
-
-    if(wifi_semaphore == NULL)
+    if(system_event_group == NULL)
     {
-        printf("Failed to create WiFi semaphore!\n");
+        printf("Event Group creation failed!\n");
         return;
     }
 
-    printf("WiFi semaphore created successfully\n");
+    printf("Queue Created.\n");
+    printf("Mutex Created.\n");
+    printf("Event Group Created.\n");
 
     //--------------------------------------------------
     // Create Tasks
     //--------------------------------------------------
+    xTaskCreate(
+        wifi_task,
+        "wifi_task",
+        4096,
+        NULL,
+        5,
+        NULL
+    );
 
-    xTaskCreate(sensor_task,
-                "sensor_task",
-                4096,
-                NULL,
-                5,
-                NULL);
+    xTaskCreate(
+        sensor_task,
+        "sensor_task",
+        4096,
+        NULL,
+        5,
+        NULL
+    );
 
-    xTaskCreate(display_task,
-                "display_task",
-                4096,
-                NULL,
-                4,
-                NULL);
+    xTaskCreate(
+        mqtt_task,
+        "mqtt_task",
+        4096,
+        NULL,
+        4,
+        NULL
+    );
 
-    xTaskCreate(wifi_task,
-                "wifi_task",
-                4096,
-                NULL,
-                3,
-                NULL);
-
-    xTaskCreate(mqtt_task,
-                "mqtt_task",
-                4096,
-                NULL,
-                3,
-                NULL);
-
-    printf("All tasks created. Scheduler running.\n");
+    printf("All tasks started.\n");
 }
