@@ -6,7 +6,7 @@
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
 #include "freertos/event_groups.h"
-
+#include "freertos/timers.h"
 //--------------------------------------------------
 // Event Group Bits
 //--------------------------------------------------
@@ -30,6 +30,8 @@ typedef struct
 QueueHandle_t sensor_queue;
 SemaphoreHandle_t i2c_mutex;
 EventGroupHandle_t system_event_group;
+TimerHandle_t mqtt_publish_timer;
+SemaphoreHandle_t publish_semaphore;
 
 //--------------------------------------------------
 // WiFi Task
@@ -112,15 +114,13 @@ void sensor_task(void *pvParameters)
 //--------------------------------------------------
 // MQTT Task
 //--------------------------------------------------
+
 void mqtt_task(void *pvParameters)
 {
     SensorData_t data;
 
-    printf("[MQTT] Waiting for WiFi AND Sensor...\n");
+    printf("[MQTT] Waiting for system ready...\n");
 
-    //--------------------------------------------------
-    // Wait for BOTH bits
-    //--------------------------------------------------
     xEventGroupWaitBits(
         system_event_group,
         WIFI_READY_BIT | SENSOR_READY_BIT,
@@ -129,17 +129,22 @@ void mqtt_task(void *pvParameters)
         portMAX_DELAY
     );
 
-    printf("[MQTT] System Ready.\n");
-    printf("[MQTT] Publishing started.\n");
+    printf("[MQTT] System ready! Publish timer started.\n");
+
+    // Start the publish timer — fires every 10 seconds
+    xTimerStart(mqtt_publish_timer, 0);
 
     while(1)
     {
-        if(xQueueReceive(sensor_queue,
+        // Sleep until timer fires
+        xSemaphoreTake(publish_semaphore, portMAX_DELAY);
+
+        // Get latest sensor data
+        if(xQueueReceive(sensor_queue_mqtt,
                          &data,
-                         portMAX_DELAY) == pdPASS)
+                         pdMS_TO_TICKS(100)) == pdPASS)
         {
-            printf("[MQTT] Publish => "
-                   "Temp: %.1f C | "
+            printf("[MQTT] Publishing → Temp: %.1f C | "
                    "Humidity: %.1f%% | "
                    "Pressure: %.1f hPa\n",
                    data.temperature,
@@ -148,7 +153,6 @@ void mqtt_task(void *pvParameters)
         }
     }
 }
-
 //--------------------------------------------------
 // Main Application
 //--------------------------------------------------
@@ -157,16 +161,17 @@ void app_main(void)
     printf("System Starting...\n");
 
     //--------------------------------------------------
-    // Create Queue
+    // Create Queues
     //--------------------------------------------------
-    sensor_queue = xQueueCreate(
-        5,
-        sizeof(SensorData_t)
-    );
+    sensor_queue_display = xQueueCreate(5, sizeof(SensorData_t));
+    if(sensor_queue_display == NULL) {
+        printf("Display queue creation failed!\n");
+        return;
+    }
 
-    if(sensor_queue == NULL)
-    {
-        printf("Queue creation failed!\n");
+    sensor_queue_mqtt = xQueueCreate(5, sizeof(SensorData_t));
+    if(sensor_queue_mqtt == NULL) {
+        printf("MQTT queue creation failed!\n");
         return;
     }
 
@@ -174,10 +179,17 @@ void app_main(void)
     // Create Mutex
     //--------------------------------------------------
     i2c_mutex = xSemaphoreCreateMutex();
-
-    if(i2c_mutex == NULL)
-    {
+    if(i2c_mutex == NULL) {
         printf("Mutex creation failed!\n");
+        return;
+    }
+
+    //--------------------------------------------------
+    // Create Semaphores
+    //--------------------------------------------------
+    publish_semaphore = xSemaphoreCreateBinary();
+    if(publish_semaphore == NULL) {
+        printf("Publish semaphore creation failed!\n");
         return;
     }
 
@@ -185,46 +197,35 @@ void app_main(void)
     // Create Event Group
     //--------------------------------------------------
     system_event_group = xEventGroupCreate();
-
-    if(system_event_group == NULL)
-    {
-        printf("Event Group creation failed!\n");
+    if(system_event_group == NULL) {
+        printf("Event group creation failed!\n");
         return;
     }
 
-    printf("Queue Created.\n");
-    printf("Mutex Created.\n");
-    printf("Event Group Created.\n");
+    //--------------------------------------------------
+    // Create Software Timer
+    //--------------------------------------------------
+    mqtt_publish_timer = xTimerCreate(
+        "mqtt_timer",
+        pdMS_TO_TICKS(10000),
+        pdTRUE,
+        (void*)0,
+        mqtt_timer_callback
+    );
+    if(mqtt_publish_timer == NULL) {
+        printf("Timer creation failed!\n");
+        return;
+    }
+
+    printf("All resources created successfully.\n");
 
     //--------------------------------------------------
     // Create Tasks
     //--------------------------------------------------
-    xTaskCreate(
-        wifi_task,
-        "wifi_task",
-        4096,
-        NULL,
-        5,
-        NULL
-    );
-
-    xTaskCreate(
-        sensor_task,
-        "sensor_task",
-        4096,
-        NULL,
-        5,
-        NULL
-    );
-
-    xTaskCreate(
-        mqtt_task,
-        "mqtt_task",
-        4096,
-        NULL,
-        4,
-        NULL
-    );
+    xTaskCreate(sensor_task,  "sensor_task",  4096, NULL, 5, NULL);
+    xTaskCreate(display_task, "display_task", 4096, NULL, 4, NULL);
+    xTaskCreate(wifi_task,    "wifi_task",    4096, NULL, 3, NULL);
+    xTaskCreate(mqtt_task,    "mqtt_task",    4096, NULL, 3, NULL);
 
     printf("All tasks started.\n");
 }
